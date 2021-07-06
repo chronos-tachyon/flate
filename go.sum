@@ -1,7 +1,7 @@
 github.com/chronos-tachyon/assert v1.2.0 h1:/otmE4+VRwr1G+vkFMyBOH4JVgkgTAfbOJFa6PXGj8M=
 github.com/chronos-tachyon/assert v1.2.0/go.mod h1:dYdZxEBttPxK1l1Ytxnx8tnwfHHflGHqFA12rjOQwdY=
-github.com/chronos-tachyon/buffer/v3 v3.0.0 h1:/8XsmovbPD1jZtLHo3casUHhU/BC18igf/YAIp0QBSo=
-github.com/chronos-tachyon/buffer/v3 v3.0.0/go.mod h1:sroUBLS2N1qS8CVIZzPyGFe6B1HfTNuT3BixoKqvBa8=
+github.com/chronos-tachyon/buffer/v3 v3.1.1 h1:KyccFdY/EfG2xkTeZT6bMbVMZXLqmU9kR+26Z2Eb0p4=
+github.com/chronos-tachyon/buffer/v3 v3.1.1/go.mod h1:sroUBLS2N1qS8CVIZzPyGFe6B1HfTNuT3BixoKqvBa8=
 github.com/chronos-tachyon/bzero v1.0.0 h1:gPkMRfJ70T1jLKdPNiaQNEqETnSirk8OUCTzxYteJA4=
 github.com/chronos-tachyon/bzero v1.0.0/go.mod h1:Evy4PETaWbNJT/X+c1etLjMeG87DvXlE+LwNUUDcrtg=
 github.com/chronos-tachyon/enumhelper v1.1.0 h1:SWEFBchIqGNDQAz3P7WGhKGmDZkVMRyqIXa1DL8ZdLg=
