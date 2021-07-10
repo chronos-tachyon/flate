@@ -349,3 +349,24 @@ func TestWriter(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkWriter(b *testing.B) {
+	txt := mustReadFile(testdataFS, "testdata/lipsum.txt")
+	fw := NewWriter(io.Discard, WithFormat(RawFormat))
+	for n := 0; n < b.N; n++ {
+		fw.Reset(io.Discard)
+
+		nn, err := fw.Write(txt)
+		if err != nil {
+			b.Fatalf("flate.Writer.Write failed: %v", err)
+		}
+		if nn != len(txt) {
+			b.Errorf("wrong length: expected %d, got %d", len(txt), nn)
+		}
+
+		err = fw.Close()
+		if err != nil {
+			b.Fatalf("flate.Writer.Close failed: %v", err)
+		}
+	}
+}

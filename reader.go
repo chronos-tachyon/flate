@@ -1,11 +1,9 @@
 package flate
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
-	"hash"
-	"hash/adler32"
-	"hash/crc32"
 	"io"
 	"sync"
 	"time"
@@ -13,12 +11,35 @@ import (
 	"github.com/chronos-tachyon/assert"
 	buffer "github.com/chronos-tachyon/buffer/v3"
 	"github.com/chronos-tachyon/huffman"
+
+	"github.com/chronos-tachyon/flate/internal/adler32"
+	"github.com/chronos-tachyon/flate/internal/crc32"
 )
 
 // Reader wraps an io.Reader and decompresses the data which flows through it.
 type Reader struct {
+	// wg keeps track of any spawned background threads.
 	wg sync.WaitGroup
-	mu sync.Mutex
+
+	// mu1 protects most Reader fields
+	mu1 sync.Mutex
+
+	// mu2 protects outputError & outputBuffer
+	mu2 sync.Mutex
+
+	// cv1 announces "please drain outputBuffer".
+	// - Wait'ed by Read callers to block until outputBuffer is non-empty.
+	// - Signal'ed by Read callers when outputBuffer still has more data after reading.
+	// - Signal'ed by readThread when outputBuffer is filled.
+	// - Broadcast'ed by readThread when outputError is set.
+	cv1 *sync.Cond
+
+	// cv2 announces "please fill outputBuffer".
+	// - Wait'ed by readThread to block until outputBuffer is non-full (ideally empty).
+	// - Signal'ed by Read callers when outputBuffer is empty.
+	cv2 *sync.Cond
+
+	// fields below are protected by mu1
 
 	format  Format
 	mlevel  MemoryLevel
@@ -26,26 +47,25 @@ type Reader struct {
 	dict    []byte
 	tracers []Tracer
 
-	r                  io.Reader
-	pr                 *io.PipeReader
-	pw                 *io.PipeWriter
-	err                error
-	inputBytesCRC32    hash.Hash32
-	outputBytesAdler32 hash.Hash32
-	outputBytesCRC32   hash.Hash32
-	input              buffer.Buffer
-	output             buffer.Buffer
-	window             buffer.Window
-	inputBytesTotal    uint64
-	inputBytesStream   uint64
-	outputBytesTotal   uint64
-	outputBytesStream  uint64
-	numStreams         uint
-	ibBlock            block
-	ibLen              byte
-	didStartReadThread bool
-	forceStop          bool
-	closed             bool
+	r                    io.Reader
+	inputError           error
+	inputBuffer          buffer.Buffer
+	decodeBuffer         buffer.Buffer
+	window               buffer.Window
+	inputBytesTotal      uint64
+	inputBytesStream     uint64
+	outputBytesTotal     uint64
+	outputBytesStream    uint64
+	numStreams           uint
+	inputBytesCRC32      crc32.Hash
+	outputBytesCRC32     crc32.Hash
+	outputBytesAdler32   adler32.Hash
+	ibBlock              block
+	ibLen                byte
+	readThreadWasStarted bool
+	readThreadWasStopped bool
+	outputErrorWasSet    bool
+	stopIsForced         bool
 
 	header       Header
 	actualFormat Format
@@ -56,6 +76,13 @@ type Reader struct {
 	hd0 huffman.Decoder
 	hd1 huffman.Decoder
 	hd2 huffman.Decoder
+
+	tmp [4]byte
+
+	// fields below are protected by mu2
+
+	outputError  error
+	outputBuffer buffer.Buffer
 }
 
 // NewReader constructs and returns a new Reader with the given io.Reader and
@@ -68,8 +95,6 @@ func NewReader(r io.Reader, opts ...Option) *Reader {
 	o.apply(opts)
 	o.populateReaderDefaults()
 
-	pr, pw := io.Pipe()
-
 	fr := &Reader{
 		format:  o.format,
 		mlevel:  o.mlevel,
@@ -77,27 +102,30 @@ func NewReader(r io.Reader, opts ...Option) *Reader {
 		dict:    o.dict,
 		tracers: o.tracers,
 
-		r:  r,
-		pr: pr,
-		pw: pw,
-
-		inputBytesCRC32:    dummyHash32{},
-		outputBytesAdler32: dummyHash32{},
-		outputBytesCRC32:   dummyHash32{},
+		r: r,
 	}
 
-	fr.input.Init(fr.inputNumBits())
-	fr.output.Init(fr.outputNumBits())
+	fr.cv1 = sync.NewCond(&fr.mu2)
+	fr.cv2 = sync.NewCond(&fr.mu2)
+
+	fr.inputBuffer.Init(fr.inputBufferNumBits())
+	fr.decodeBuffer.Init(fr.decodeBufferNumBits())
 	fr.window.Init(fr.windowNumBits())
+
+	fr.outputBuffer.Init(fr.outputBufferNumBits())
 
 	return fr
 }
 
-func (fr *Reader) inputNumBits() uint {
+func (fr *Reader) inputBufferNumBits() uint {
 	return uint(fr.mlevel + 6)
 }
 
-func (fr *Reader) outputNumBits() uint {
+func (fr *Reader) decodeBufferNumBits() uint {
+	return uint(fr.mlevel + 6)
+}
+
+func (fr *Reader) outputBufferNumBits() uint {
 	return uint(fr.mlevel + 6)
 }
 
@@ -107,25 +135,25 @@ func (fr *Reader) windowNumBits() uint {
 
 // Format returns the Format which this Reader uses.
 func (fr *Reader) Format() Format {
-	fr.mu.Lock()
+	fr.mu1.Lock()
 	format := fr.format
-	fr.mu.Unlock()
+	fr.mu1.Unlock()
 	return format
 }
 
 // MemoryLevel returns the MemoryLevel which this Reader uses.
 func (fr *Reader) MemoryLevel() MemoryLevel {
-	fr.mu.Lock()
+	fr.mu1.Lock()
 	mlevel := fr.mlevel
-	fr.mu.Unlock()
+	fr.mu1.Unlock()
 	return mlevel
 }
 
 // WindowBits returns the WindowBits which this Reader uses.
 func (fr *Reader) WindowBits() WindowBits {
-	fr.mu.Lock()
+	fr.mu1.Lock()
 	wbits := fr.wbits
-	fr.mu.Unlock()
+	fr.mu1.Unlock()
 	return wbits
 }
 
@@ -133,24 +161,24 @@ func (fr *Reader) WindowBits() WindowBits {
 // if no such dictionary is in use.
 func (fr *Reader) Dict() []byte {
 	var dict []byte
-	fr.mu.Lock()
+	fr.mu1.Lock()
 	if len(fr.dict) != 0 {
 		dict = make([]byte, len(fr.dict))
 		copy(dict, fr.dict)
 	}
-	fr.mu.Unlock()
+	fr.mu1.Unlock()
 	return dict
 }
 
 // Tracers returns the Tracers which this Reader uses.
 func (fr *Reader) Tracers() []Tracer {
 	var tracers []Tracer
-	fr.mu.Lock()
+	fr.mu1.Lock()
 	if len(fr.tracers) != 0 {
 		tracers = make([]Tracer, len(fr.tracers))
 		copy(tracers, fr.tracers)
 	}
-	fr.mu.Unlock()
+	fr.mu1.Unlock()
 	return tracers
 }
 
@@ -167,24 +195,27 @@ func (fr *Reader) Reset(r io.Reader, opts ...Option) {
 		assert.NotNil(&opt)
 	}
 
-	fr.mu.Lock()
-	defer fr.mu.Unlock()
+	fr.mu1.Lock()
+	defer fr.mu1.Unlock()
+
+	fr.mu2.Lock()
+	defer fr.mu2.Unlock()
 
 	fr.stopReadThreadLocked()
 
 	fr.r = r
-	fr.pr, fr.pw = io.Pipe()
-	fr.err = nil
-	fr.inputBytesCRC32 = dummyHash32{}
-	fr.outputBytesAdler32 = dummyHash32{}
-	fr.outputBytesCRC32 = dummyHash32{}
-	fr.didStartReadThread = false
-	fr.forceStop = false
-	fr.closed = false
+	fr.inputError = nil
+	fr.readThreadWasStarted = false
+	fr.readThreadWasStopped = false
+	fr.outputErrorWasSet = false
+	fr.stopIsForced = false
 
-	fr.input.Clear()
-	fr.output.Clear()
+	fr.inputBuffer.Clear()
+	fr.decodeBuffer.Clear()
 	fr.window.Clear()
+
+	fr.outputError = nil
+	fr.outputBuffer.Clear()
 
 	if len(opts) == 0 {
 		return
@@ -206,14 +237,17 @@ func (fr *Reader) Reset(r io.Reader, opts ...Option) {
 	fr.dict = o.dict
 	fr.tracers = o.tracers
 
-	if numBits := fr.inputNumBits(); fr.input.NumBits() != numBits {
-		fr.input.Init(numBits)
+	if numBits := fr.inputBufferNumBits(); fr.inputBuffer.NumBits() != numBits {
+		fr.inputBuffer.Init(numBits)
 	}
-	if numBits := fr.outputNumBits(); fr.output.NumBits() != numBits {
-		fr.output.Init(numBits)
+	if numBits := fr.decodeBufferNumBits(); fr.decodeBuffer.NumBits() != numBits {
+		fr.decodeBuffer.Init(numBits)
 	}
 	if numBits := fr.windowNumBits(); fr.window.NumBits() != numBits {
 		fr.window.Init(numBits)
+	}
+	if numBits := fr.outputBufferNumBits(); fr.outputBuffer.NumBits() != numBits {
+		fr.outputBuffer.Init(numBits)
 	}
 }
 
@@ -221,7 +255,30 @@ func (fr *Reader) Reset(r io.Reader, opts ...Option) {
 // Conforms to the io.Reader interface.
 func (fr *Reader) Read(p []byte) (int, error) {
 	fr.startReadThread()
-	return fr.pr.Read(p)
+
+	fr.mu2.Lock()
+	defer fr.mu2.Unlock()
+
+	if fr.outputError == nil && fr.outputBuffer.IsEmpty() {
+		fr.cv2.Signal()
+		for fr.outputError == nil && fr.outputBuffer.IsEmpty() {
+			fr.cv1.Wait()
+		}
+	}
+
+	if fr.outputBuffer.IsEmpty() {
+		return 0, fr.outputError
+	}
+
+	nn, _ := fr.outputBuffer.Read(p)
+
+	if fr.outputBuffer.IsEmpty() {
+		fr.cv2.Signal()
+	} else {
+		fr.cv1.Signal()
+	}
+
+	return nn, nil
 }
 
 // Close terminates decompression and closes this Reader.
@@ -232,62 +289,70 @@ func (fr *Reader) Read(p []byte) (int, error) {
 // Close is Reset, which will return the Reader to a non-closed state.
 //
 func (fr *Reader) Close() error {
-	fr.mu.Lock()
+	fr.mu1.Lock()
 	fr.stopReadThreadLocked()
-	fr.mu.Unlock()
+	fr.mu1.Unlock()
 	return nil
 }
 
 func (fr *Reader) startReadThread() {
-	fr.mu.Lock()
-	if !fr.didStartReadThread {
-		fr.didStartReadThread = true
+	fr.mu1.Lock()
+	if !fr.readThreadWasStarted {
+		fr.readThreadWasStarted = true
 		fr.wg.Add(1)
 		go fr.readThread()
 	}
-	fr.mu.Unlock()
+	fr.mu1.Unlock()
 }
 
 func (fr *Reader) stopReadThreadLocked() {
-	if fr.didStartReadThread {
-		fr.forceStop = true
-		fr.mu.Unlock()
+	if fr.readThreadWasStarted && !fr.readThreadWasStopped {
+		fr.mu2.Lock()
+		fr.outputError = context.Canceled // FIXME
+		fr.outputBuffer.Clear()
+		fr.cv1.Broadcast()
+		fr.cv2.Broadcast()
+		fr.mu2.Unlock()
 
-		_, _ = io.Copy(io.Discard, fr.pr)
+		fr.outputErrorWasSet = true
+		fr.stopIsForced = true
+
+		fr.mu1.Unlock()
 		fr.wg.Wait()
-
-		fr.mu.Lock()
+		fr.mu1.Lock()
 	}
 }
 
 func (fr *Reader) readThread() {
-	fr.mu.Lock()
+	fr.mu1.Lock()
 
 	fr.numStreams = 0
-	for fr.err == nil {
+	for fr.inputError == nil {
 		if !fr.readHeader() {
 			break
 		}
 
-		fr.outputBytesAdler32 = adler32.New()
-		fr.outputBytesCRC32 = crc32.NewIEEE()
+		fr.outputBytesAdler32.Reset()
+		fr.outputBytesCRC32.Reset()
 
 		for fr.readFlateBlock() {
 			// pass
 		}
+
+		fr.decodeBufferMustFlush()
 
 		if !fr.readFooter() {
 			break
 		}
 	}
 
-	if fr.err == nil {
-		fr.err = io.EOF
+	if fr.inputError == nil {
+		fr.inputError = io.EOF
 	}
 
-	fr.outputBufferMustFlush()
 	fr.propagateError(false)
-	fr.mu.Unlock()
+	fr.readThreadWasStopped = true
+	fr.mu1.Unlock()
 	fr.wg.Done()
 }
 
@@ -295,9 +360,9 @@ func (fr *Reader) readHeader() bool {
 	fr.inputBytesStream = 0
 	fr.outputBytesStream = 0
 
-	if fr.input.IsEmpty() {
+	if fr.inputBuffer.IsEmpty() {
 		fr.inputBufferFill()
-		if fr.input.IsEmpty() {
+		if fr.inputBuffer.IsEmpty() {
 			fr.propagateError(false)
 			return false
 		}
@@ -352,9 +417,6 @@ func (fr *Reader) readFooter() bool {
 	a32 := fr.outputBytesAdler32.Sum32()
 	c32 := fr.outputBytesCRC32.Sum32()
 
-	fr.outputBytesAdler32 = dummyHash32{}
-	fr.outputBytesCRC32 = dummyHash32{}
-
 	fr.sendEvent(Event{
 		Type: StreamEndEvent,
 		Footer: &FooterEvent{
@@ -387,7 +449,7 @@ func (fr *Reader) readFooter() bool {
 }
 
 func (fr *Reader) readHeaderAuto() bool {
-	p := fr.input.PrepareBulkRead(2)
+	p := fr.inputBuffer.PrepareBulkRead(2)
 	if len(p) < 2 {
 		return fr.readHeaderRaw()
 	}
@@ -489,7 +551,7 @@ func (fr *Reader) readFooterZlib(computedAdler32 uint32) bool {
 }
 
 func (fr *Reader) readHeaderGZIP() bool {
-	fr.inputBytesCRC32 = crc32.NewIEEE()
+	fr.inputBytesCRC32.Reset()
 
 	var header [10]byte
 	p, ok := fr.inputBufferRead(header[:])
@@ -540,7 +602,6 @@ func (fr *Reader) readHeaderGZIP() bool {
 	ok = ok && fr.readHeaderGZIPComment(bitFCOMMENT, &fr.header)
 
 	c32 := fr.inputBytesCRC32.Sum32()
-	fr.inputBytesCRC32 = dummyHash32{}
 
 	ok = ok && fr.readHeaderGZIPCRC16(bitFHCRC, c32)
 	if !ok {
@@ -648,10 +709,6 @@ func (fr *Reader) readFooterGZIP(computedCRC32 uint32) bool {
 }
 
 func (fr *Reader) readFlateBlock() (more bool) {
-	if fr.closed {
-		return false
-	}
-
 	if ok := fr.inputBitsFill(3); !ok {
 		fr.propagateError(true)
 		return false
@@ -722,7 +779,7 @@ func (fr *Reader) readFlateBlockStored() bool {
 		return false
 	}
 
-	fr.outputBufferWrite(p)
+	fr.decodeBufferWrite(p)
 
 	return true
 }
@@ -756,7 +813,6 @@ func (fr *Reader) decodeHuffmanBlock(blockType BlockType, isFinal bool) bool {
 	hLL := fr.hLL
 	hD := fr.hD
 
-Loop:
 	for {
 		symbol, ok := fr.readSymbol(hLL)
 		if !ok {
@@ -768,12 +824,13 @@ Loop:
 		if !ok {
 			return false
 		}
-		if t.distance == 0 && t.literalOrLength < 256 {
-			fr.outputBufferWriteByte(byte(t.literalOrLength))
-			continue Loop
-		}
+
 		if t.distance == 0 {
-			break Loop
+			if t.literalOrLength >= 256 {
+				return true
+			}
+			fr.decodeBufferWriteByte(byte(t.literalOrLength))
+			continue
 		}
 
 		symbol, ok = fr.readSymbol(hD)
@@ -789,18 +846,25 @@ Loop:
 
 		length := uint(t.literalOrLength)
 		distance := uint(t.distance)
+
+		p, err := fr.window.LookupSlice(distance, length)
+		if err != nil {
+			fr.corruptf("distance %d > window.Size %d", distance, fr.window.Size())
+			return false
+		}
+		fr.decodeBufferWrite(p)
+		length -= uint(len(p))
+
 		for length != 0 {
 			ch, err := fr.window.LookupByte(distance)
 			if err != nil {
 				fr.corruptf("distance %d > window.Size %d", distance, fr.window.Size())
 				return false
 			}
-			fr.outputBufferWriteByte(ch)
+			fr.decodeBufferWriteByte(ch)
 			length--
 		}
 	}
-
-	return true
 }
 
 func (fr *Reader) decodeLL(symbol huffman.Symbol) (token, bool) {
@@ -1081,15 +1145,17 @@ func (fr *Reader) readSymbol(hdec *huffman.Decoder) (symbol huffman.Symbol, ok b
 }
 
 func (fr *Reader) inputBufferFill() {
-	if fr.err == nil {
-		var err error
-		if fr.forceStop {
-			err = io.EOF
-		} else {
-			_, err = fr.input.ReadFrom(fr.r)
-		}
-		fr.err = err
+	if fr.inputError != nil {
+		return
 	}
+
+	if fr.stopIsForced {
+		fr.inputError = io.EOF
+		return
+	}
+
+	_, err := fr.inputBuffer.ReadFrom(fr.r)
+	fr.inputError = err
 }
 
 func (fr *Reader) inputBufferRead(p []byte) ([]byte, bool) {
@@ -1102,13 +1168,13 @@ func (fr *Reader) inputBufferRead(p []byte) ([]byte, bool) {
 
 	pIndex := uint(0)
 	for pIndex < pLen {
-		if fr.input.IsEmpty() {
+		if fr.inputBuffer.IsEmpty() {
 			fr.inputBufferFill()
-			if fr.input.IsEmpty() {
+			if fr.inputBuffer.IsEmpty() {
 				break
 			}
 		}
-		nn, _ := fr.input.Read(p[pIndex:])
+		nn, _ := fr.inputBuffer.Read(p[pIndex:])
 		pIndex += uint(nn)
 	}
 
@@ -1119,8 +1185,7 @@ func (fr *Reader) inputBufferRead(p []byte) ([]byte, bool) {
 }
 
 func (fr *Reader) inputBufferReadU16(bo binary.ByteOrder) (u16 uint16, ok bool) {
-	var tmp [2]byte
-	p, pOK := fr.inputBufferRead(tmp[0:2])
+	p, pOK := fr.inputBufferRead(fr.tmp[:2])
 	if pOK {
 		u16 = bo.Uint16(p)
 		ok = true
@@ -1129,8 +1194,7 @@ func (fr *Reader) inputBufferReadU16(bo binary.ByteOrder) (u16 uint16, ok bool) 
 }
 
 func (fr *Reader) inputBufferReadU32(bo binary.ByteOrder) (u32 uint32, ok bool) {
-	var tmp [4]byte
-	p, pOK := fr.inputBufferRead(tmp[0:4])
+	p, pOK := fr.inputBufferRead(fr.tmp[:4])
 	if pOK {
 		u32 = bo.Uint32(p)
 		ok = true
@@ -1143,14 +1207,14 @@ func (fr *Reader) inputBufferReadStringZ() (str string, ok bool) {
 	defer giveStringsBuilder(sb)
 
 	for {
-		if fr.input.IsEmpty() {
+		if fr.inputBuffer.IsEmpty() {
 			fr.inputBufferFill()
-			if fr.input.IsEmpty() {
+			if fr.inputBuffer.IsEmpty() {
 				break
 			}
 		}
 
-		ch, _ := fr.input.ReadByte()
+		ch, _ := fr.inputBuffer.ReadByte()
 		fr.inputBytesTotal++
 		fr.inputBytesStream++
 		fr.inputBytesCRC32.Write([]byte{ch})
@@ -1172,14 +1236,14 @@ func (fr *Reader) inputBitsFill(atLeast byte) bool {
 	assert.Assertf(atLeast <= limit, "atLeast %d > limit %d", atLeast, limit)
 
 	for fr.ibLen < atLeast {
-		if fr.input.IsEmpty() {
+		if fr.inputBuffer.IsEmpty() {
 			fr.inputBufferFill()
-			if fr.input.IsEmpty() {
+			if fr.inputBuffer.IsEmpty() {
 				return false
 			}
 		}
 
-		ch, _ := fr.input.ReadByte()
+		ch, _ := fr.inputBuffer.ReadByte()
 		fr.inputBytesTotal++
 		fr.inputBytesStream++
 		fr.inputBytesCRC32.Write([]byte{ch})
@@ -1214,102 +1278,107 @@ func (fr *Reader) inputBitsDiscard() {
 	fr.ibLen = 0
 }
 
-func (fr *Reader) outputBufferWrite(p []byte) bool {
-	pLen := uint(len(p))
-	if pLen == 0 {
-		return true
-	}
-
-	var i uint
-	for i < pLen {
-		fr.outputBufferTryFlush()
-
-		nn, _ := fr.output.Write(p[i:])
-
-		fr.outputBytesTotal += uint64(nn)
-		fr.outputBytesStream += uint64(nn)
-
-		j := i + uint(nn)
-		_, _ = fr.window.Write(p[i:j])
-		_, _ = fr.outputBytesAdler32.Write(p[i:j])
-		_, _ = fr.outputBytesCRC32.Write(p[i:j])
-		i = j
+func (fr *Reader) decodeBufferWrite(p []byte) bool {
+	length := uint(len(p))
+	for length > 0 {
+		fr.decodeBufferTryFlush()
+		nn, _ := fr.decodeBuffer.Write(p)
+		_, _ = fr.window.Write(p[:nn])
+		p = p[nn:]
+		length -= uint(nn)
 	}
 	return true
 }
 
-func (fr *Reader) outputBufferWriteByte(ch byte) bool {
-	fr.outputBufferTryFlush()
-
-	err := fr.output.WriteByte(ch)
-	if err != nil {
-		return false
+func (fr *Reader) decodeBufferWriteByte(ch byte) bool {
+	fr.decodeBufferTryFlush()
+	err := fr.decodeBuffer.WriteByte(ch)
+	if err == nil {
+		_ = fr.window.WriteByte(ch)
 	}
-
-	fr.outputBytesTotal++
-	fr.outputBytesStream++
-
-	_ = fr.window.WriteByte(ch)
-
-	tmp := [1]byte{ch}
-	_, _ = fr.outputBytesAdler32.Write(tmp[0:1])
-	_, _ = fr.outputBytesCRC32.Write(tmp[0:1])
-
-	return true
+	return (err == nil)
 }
 
-func (fr *Reader) outputBufferTryFlush() {
-	if fr.output.IsFull() {
-		fr.outputBufferMustFlush()
+func (fr *Reader) decodeBufferTryFlush() {
+	if fr.decodeBuffer.IsFull() {
+		fr.decodeBufferMustFlush()
 	}
 }
 
-func (fr *Reader) outputBufferMustFlush() {
-	size := fr.output.Size()
-	for !fr.output.IsEmpty() {
-		p := fr.output.PrepareBulkRead(size)
-		pw := fr.pw
+func (fr *Reader) decodeBufferMustFlush() {
+	if fr.stopIsForced {
+		fr.decodeBuffer.Clear()
+		return
+	}
 
-		fr.mu.Unlock()
-		nn, _ := pw.Write(p)
-		fr.mu.Lock()
+	size := fr.decodeBuffer.Size()
+	for !fr.decodeBuffer.IsEmpty() {
+		fr.mu1.Unlock()
+		fr.mu2.Lock()
+		for fr.outputBuffer.IsFull() {
+			fr.cv2.Wait()
+		}
+		fr.mu2.Unlock()
+		fr.mu1.Lock()
 
-		fr.output.CommitBulkRead(uint(nn))
+		if fr.stopIsForced {
+			fr.decodeBuffer.Clear()
+			return
+		}
+
+		p := fr.decodeBuffer.PrepareBulkRead(size)
+
+		fr.mu2.Lock()
+		nn, _ := fr.outputBuffer.Write(p)
+		if nn != 0 {
+			fr.cv1.Signal()
+		}
+		fr.mu2.Unlock()
+
+		if nn != 0 {
+			fr.outputBytesTotal += uint64(nn)
+			fr.outputBytesStream += uint64(nn)
+			_, _ = fr.outputBytesAdler32.Write(p[:nn])
+			_, _ = fr.outputBytesCRC32.Write(p[:nn])
+
+			fr.decodeBuffer.CommitBulkRead(uint(nn))
+		}
 	}
 }
 
 func (fr *Reader) propagateError(eofIsError bool) {
-	if fr.closed || fr.err == nil {
+	if fr.inputError == nil {
 		return
 	}
 
-	err := fr.err
+	err := fr.inputError
 	if eofIsError && err == io.EOF {
 		err = io.ErrUnexpectedEOF
 	}
-
-	fr.closed = true
-	if err == io.EOF {
-		_ = fr.pw.Close()
-	} else {
-		_ = fr.pw.CloseWithError(err)
-	}
+	fr.closeWithError(err)
 }
 
 func (fr *Reader) corruptf(format string, v ...interface{}) {
-	if fr.closed {
-		return
-	}
-
 	message := fmt.Sprintf(format, v...)
 	err := CorruptInputError{
 		OffsetTotal:  fr.inputBytesTotal,
 		OffsetStream: fr.inputBytesStream,
 		Problem:      message,
 	}
+	fr.closeWithError(err)
+}
 
-	fr.closed = true
-	_ = fr.pw.CloseWithError(err)
+func (fr *Reader) closeWithError(err error) {
+	if fr.outputErrorWasSet {
+		return
+	}
+
+	fr.mu2.Lock()
+	fr.outputError = err
+	fr.cv1.Broadcast()
+	fr.mu2.Unlock()
+
+	fr.outputErrorWasSet = true
 }
 
 func (fr *Reader) sendEvent(event Event) {

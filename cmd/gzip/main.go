@@ -1,10 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"io/ioutil"
+	stdlog "log"
 	"os"
 	"runtime/pprof"
+	"strings"
 	"time"
 
 	"github.com/chronos-tachyon/flate"
@@ -14,18 +17,10 @@ import (
 )
 
 var (
-	flagCPUProfile = ""
-	flagMemProfile = ""
-
-	flagFormat       = FormatFlag{flate.DefaultFormat}
-	flagStrategy     = StrategyFlag{flate.DefaultStrategy}
-	flagCLevel       = CompressLevelFlag{flate.DefaultCompression}
-	flagMLevel       = MemoryLevelFlag{flate.DefaultMemory}
-	flagWBits        = WindowBitsFlag{flate.DefaultWindowBits}
-	flagDict         = ""
-	flagFileName     = ""
-	flagComment      = ""
-	flagLastModified = TimeFlag{time.Time{}}
+	flagVersion   = false
+	flagDebug     = false
+	flagTrace     = false
+	flagLogStderr = false
 
 	flagStdout     = false
 	flagDecompress = false
@@ -42,10 +37,29 @@ var (
 	flag7 = false
 	flag8 = false
 	flag9 = false
+
+	flagFormat       = FormatFlag{flate.DefaultFormat}
+	flagStrategy     = StrategyFlag{flate.DefaultStrategy}
+	flagCLevel       = CompressLevelFlag{flate.DefaultCompression}
+	flagMLevel       = MemoryLevelFlag{flate.DefaultMemory}
+	flagWBits        = WindowBitsFlag{flate.DefaultWindowBits}
+	flagDict         = ""
+	flagFileName     = ""
+	flagComment      = ""
+	flagLastModified = TimeFlag{time.Time{}}
+
+	flagCPUProfile = ""
+	flagMemProfile = ""
 )
 
 func init() {
 	getopt.SetParameters("[<input>]")
+
+	getopt.FlagLong(&flagVersion, "version", 'V', "print version and exit")
+
+	getopt.FlagLong(&flagDebug, "verbose", 'v', "enable debug logging")
+	getopt.FlagLong(&flagTrace, "debug", 'D', "enable debug and trace logging")
+	getopt.FlagLong(&flagLogStderr, "log-stderr", 'L', "log JSON to stderr")
 
 	getopt.FlagLong(&flagCPUProfile, "cpu-profile", 0, "CPU profile output file")
 	getopt.FlagLong(&flagMemProfile, "mem-profile", 0, "memory profile output file")
@@ -80,11 +94,32 @@ func init() {
 func main() {
 	getopt.Parse()
 
+	if flagVersion {
+		fmt.Println(strings.TrimSpace(version))
+		os.Exit(0)
+	}
+
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	zerolog.DurationFieldUnit = time.Second
 	zerolog.DurationFieldInteger = false
-	zerolog.SetGlobalLevel(zerolog.TraceLevel)
-	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	if flagDebug {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
+	if flagTrace {
+		zerolog.SetGlobalLevel(zerolog.TraceLevel)
+	}
+
+	switch {
+	case flagLogStderr:
+		// do nothing
+
+	default:
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	}
+
+	stdlog.SetFlags(0)
+	stdlog.SetOutput(log.Logger)
 
 	switch {
 	case flag0:

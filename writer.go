@@ -4,9 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash"
-	"hash/adler32"
-	"hash/crc32"
 	"io"
 	"io/fs"
 	"math"
@@ -18,6 +15,9 @@ import (
 	buffer "github.com/chronos-tachyon/buffer/v3"
 	"github.com/chronos-tachyon/huffman"
 	"github.com/hashicorp/go-multierror"
+
+	"github.com/chronos-tachyon/flate/internal/adler32"
+	"github.com/chronos-tachyon/flate/internal/crc32"
 )
 
 type flushWriter interface {
@@ -47,9 +47,9 @@ type Writer struct {
 
 	w                 io.Writer
 	err               error
-	inputBytesAdler32 hash.Hash32
-	inputBytesCRC32   hash.Hash32
-	outputBytesCRC32  hash.Hash32
+	inputBytesAdler32 adler32.Hash
+	inputBytesCRC32   crc32.Hash
+	outputBytesCRC32  crc32.Hash
 	hybrid            buffer.LZ77
 	output            buffer.Buffer
 	inputBytesTotal   uint64
@@ -83,10 +83,6 @@ func NewWriter(w io.Writer, opts ...Option) *Writer {
 		tracers:  o.tracers,
 
 		w: w,
-
-		inputBytesAdler32: dummyHash32{},
-		inputBytesCRC32:   dummyHash32{},
-		outputBytesCRC32:  dummyHash32{},
 	}
 
 	fw.hybrid.Init(fw.hybridOptions())
@@ -239,9 +235,6 @@ func (fw *Writer) Reset(w io.Writer, opts ...Option) {
 
 	fw.w = w
 	fw.err = nil
-	fw.inputBytesAdler32 = dummyHash32{}
-	fw.inputBytesCRC32 = dummyHash32{}
-	fw.outputBytesCRC32 = dummyHash32{}
 	fw.state = noStreamWriterState
 
 	fw.hybrid.Clear()
@@ -385,16 +378,10 @@ func (fw *Writer) Write(buf []byte) (int, error) {
 
 	var i, j uint
 	for i < length {
-		nn, _ := fw.hybrid.Write(buf[i:])
+		nn, err := fw.hybrid.Write(buf[i:])
 		j = i + uint(nn)
 
-		consumeAll := false
-		if nn == 0 {
-			consumeAll = true
-		}
-		if fw.hybrid.IsFull() {
-			consumeAll = true
-		}
+		consumeAll := (nn == 0) || (err == buffer.ErrFull)
 		if !fw.compressImpl(consumeAll) {
 			return 0, fw.err
 		}
@@ -614,8 +601,8 @@ func (fw *Writer) writeHeader() bool {
 		Header: h,
 	})
 
-	fw.inputBytesAdler32 = adler32.New()
-	fw.inputBytesCRC32 = crc32.NewIEEE()
+	fw.inputBytesAdler32.Reset()
+	fw.inputBytesCRC32.Reset()
 	return true
 }
 
@@ -626,9 +613,6 @@ func (fw *Writer) writeFooter() bool {
 
 	a32 := fw.inputBytesAdler32.Sum32()
 	c32 := fw.inputBytesCRC32.Sum32()
-
-	fw.inputBytesAdler32 = dummyHash32{}
-	fw.inputBytesCRC32 = dummyHash32{}
 
 	fw.sendEvent(Event{
 		Type: StreamEndEvent,
@@ -703,7 +687,7 @@ func (fw *Writer) writeFooterZlib(a32 uint32) bool {
 }
 
 func (fw *Writer) writeHeaderGZIP() bool {
-	fw.outputBytesCRC32 = crc32.NewIEEE()
+	fw.outputBytesCRC32.Reset()
 
 	var header [10]byte
 
@@ -748,7 +732,6 @@ func (fw *Writer) writeHeaderGZIP() bool {
 	ok = ok && func3(fw)
 
 	c32 := fw.outputBytesCRC32.Sum32()
-	fw.outputBytesCRC32 = dummyHash32{}
 
 	ok = ok && fw.outputBufferWriteU16(binary.LittleEndian, uint16(c32))
 	return ok
@@ -975,8 +958,10 @@ func compressFast(fw *Writer, consumeAll bool, good, lazy, nice, chain uint) boo
 }
 
 func compressSlow(fw *Writer, consumeAll bool, good, lazy, nice, chain uint) bool {
+	const compressedBlockSize = 4096
+
 	available := fw.hybrid.Len()
-	if available < 4096 && !consumeAll && !fw.hybrid.IsFull() {
+	if available < compressedBlockSize && !consumeAll && !fw.hybrid.IsFull() {
 		return true
 	}
 
@@ -990,6 +975,8 @@ func compressSlow(fw *Writer, consumeAll bool, good, lazy, nice, chain uint) boo
 	for available != 0 {
 		p, distance, length, found := fw.inputBufferAdvance()
 		if found {
+			assert.Assertf(length >= 3, "length %d < 3", length)
+			assert.Assertf(distance >= 1, "distance %d < 1", distance)
 			bb.Write(p)
 			*tokens = append(*tokens, makeCopyToken(uint16(length), uint16(distance)))
 		} else {
