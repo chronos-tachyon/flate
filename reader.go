@@ -10,6 +10,7 @@ import (
 
 	"github.com/chronos-tachyon/assert"
 	buffer "github.com/chronos-tachyon/buffer/v3"
+	"github.com/chronos-tachyon/bufferpool"
 	"github.com/chronos-tachyon/huffman"
 
 	"github.com/chronos-tachyon/flate/internal/adler32"
@@ -1203,8 +1204,8 @@ func (fr *Reader) inputBufferReadU32(bo binary.ByteOrder) (u32 uint32, ok bool) 
 }
 
 func (fr *Reader) inputBufferReadStringZ() (str string, ok bool) {
-	sb := takeStringsBuilder()
-	defer giveStringsBuilder(sb)
+	bb := bufferpool.Get()
+	defer bufferpool.Put(bb)
 
 	for {
 		if fr.inputBuffer.IsEmpty() {
@@ -1224,10 +1225,10 @@ func (fr *Reader) inputBufferReadStringZ() (str string, ok bool) {
 			break
 		}
 
-		sb.WriteByte(ch)
+		bb.WriteByte(ch)
 	}
 
-	str = sb.String()
+	str = bb.String()
 	return
 }
 

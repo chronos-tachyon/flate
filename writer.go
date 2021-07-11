@@ -13,6 +13,7 @@ import (
 
 	"github.com/chronos-tachyon/assert"
 	buffer "github.com/chronos-tachyon/buffer/v3"
+	"github.com/chronos-tachyon/bufferpool"
 	"github.com/chronos-tachyon/huffman"
 	"github.com/hashicorp/go-multierror"
 
@@ -965,8 +966,8 @@ func compressSlow(fw *Writer, consumeAll bool, good, lazy, nice, chain uint) boo
 		return true
 	}
 
-	bb := takeBytesBuffer()
-	defer giveBytesBuffer(bb)
+	bb := bufferpool.Get()
+	defer bufferpool.Put(bb)
 	bb.Grow(int(available))
 
 	tokens := takeTokens()
